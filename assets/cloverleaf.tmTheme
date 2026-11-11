@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- syntax colors for code blocks: the six ampersand accents on its warm dark surface -->
+<plist version="1.0">
+<dict>
+  <key>name</key><string>cloverleaf</string>
+  <key>settings</key>
+  <array>
+    <dict><key>settings</key><dict>
+      <key>background</key><string>#201e1b</string>
+      <key>foreground</key><string>#ece9e3</string>
+      <key>caret</key><string>#e58f6f</string>
+      <key>selection</key><string>#35322d</string>
+      <key>lineHighlight</key><string>#2b2925</string>
+    </dict></dict>
+    <dict><key>name</key><string>Comment</string><key>scope</key><string>comment, punctuation.definition.comment</string>
+      <key>settings</key><dict><key>foreground</key><string>#6c6861</string><key>fontStyle</key><string>italic</string></dict></dict>
+    <dict><key>name</key><string>String</string><key>scope</key><string>string, punctuation.definition.string</string>
+      <key>settings</key><dict><key>foreground</key><string>#9cc46b</string></dict></dict>
+    <dict><key>name</key><string>Number / constant</string><key>scope</key><string>constant.numeric, constant.language, constant.character, constant.other</string>
+      <key>settings</key><dict><key>foreground</key><string>#cfa072</string></dict></dict>
+    <dict><key>name</key><string>Keyword</string><key>scope</key><string>keyword, storage.modifier, keyword.control, keyword.operator.word</string>
+      <key>settings</key><dict><key>foreground</key><string>#e58f6f</string></dict></dict>
+    <dict><key>name</key><string>Operator</string><key>scope</key><string>keyword.operator, punctuation.separator, punctuation.terminator</string>
+      <key>settings</key><dict><key>foreground</key><string>#9b968e</string></dict></dict>
+    <dict><key>name</key><string>Type</string><key>scope</key><string>storage.type, entity.name.type, entity.name.class, support.type, support.class, entity.other.inherited-class</string>
+      <key>settings</key><dict><key>foreground</key><string>#a98fd6</string></dict></dict>
+    <dict><key>name</key><string>Function</string><key>scope</key><string>entity.name.function, support.function, meta.function-call, variable.function</string>
+      <key>settings</key><dict><key>foreground</key><string>#72aed0</string></dict></dict>
+    <dict><key>name</key><string>Variable / parameter</string><key>scope</key><string>variable.parameter, variable.language</string>
+      <key>settings</key><dict><key>foreground</key><string>#dab084</string></dict></dict>
+    <dict><key>name</key><string>Preprocessor / macro / attribute</string><key>scope</key><string>meta.preprocessor, keyword.control.import, keyword.control.directive, entity.name.macro, support.macro, entity.other.attribute-name, meta.annotation</string>
+      <key>settings</key><dict><key>foreground</key><string>#95a3b8</string></dict></dict>
+    <dict><key>name</key><string>Tag</string><key>scope</key><string>entity.name.tag</string>
+      <key>settings</key><dict><key>foreground</key><string>#e58f6f</string></dict></dict>
+    <dict><key>name</key><string>Heading</string><key>scope</key><string>markup.heading, entity.name.section</string>
+      <key>settings</key><dict><key>foreground</key><string>#e58f6f</string><key>fontStyle</key><string>bold</string></dict></dict>
+    <dict><key>name</key><string>Inserted</string><key>scope</key><string>markup.inserted</string>
+      <key>settings</key><dict><key>foreground</key><string>#8cb35c</string></dict></dict>
+    <dict><key>name</key><string>Deleted</string><key>scope</key><string>markup.deleted</string>
+      <key>settings</key><dict><key>foreground</key><string>#e0705f</string></dict></dict>
+    <dict><key>name</key><string>Invalid</string><key>scope</key><string>invalid</string>
+      <key>settings</key><dict><key>foreground</key><string>#e0705f</string></dict></dict>
+  </array>
+</dict>
+</plist>

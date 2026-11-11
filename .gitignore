@@ -1,0 +1,22 @@
+# build output
+target/
+
+# debug screenshots (CLOVERLEAF_SHOT)
+*.ppm
+
+# never commit these, even by accident
+.env
+.env.*
+*.pem
+*.key
+auth.json
+state.json
+opencode.json
+opencode.jsonc
+.opencode/
+
+# editor / os junk
+*.swp
+.DS_Store
+.idea/
+.vscode/

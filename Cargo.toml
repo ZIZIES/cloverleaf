@@ -1,0 +1,25 @@
+[package]
+name = "cloverleaf"
+version = "0.1.0"
+edition = "2024"
+description = "a native gui for opencode"
+license = "Apache-2.0"
+repository = "https://github.com/ZIZIES/cloverleaf"
+
+[dependencies]
+eframe = "0.37"
+egui = "0.37"
+egui_commonmark = { version = "0.26", default-features = false, features = ["pulldown_cmark", "better_syntax_highlighting"] }
+ureq = { version = "3", features = ["json"] }
+serde_json = "1"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
