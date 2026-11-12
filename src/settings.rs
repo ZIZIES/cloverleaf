@@ -36,8 +36,16 @@ pub struct Integration {
     pub key: bool,                    // accepts a pasted api key
     pub key_fields: Vec<Field>,       // extra questions that go with the key (azure resource name etc)
     pub logins: Vec<(String, String, Vec<Field>)>, // oauth methods: (method id, button label, extra questions)
+    pub externals: Vec<(String, String)>, // logins owned by another program, e.g. claude code: (method id, label)
     pub env: Vec<String>,             // env vars it also reads
     pub conns: Vec<Conn>,
+}
+
+// a provider whose server runs on this machine (ollama, lm studio, ...). opencode finds these by itself.
+pub struct Local {
+    pub id: String,
+    pub name: String,
+    pub url: String,
 }
 
 pub struct Conn {
@@ -86,7 +94,7 @@ pub struct OAuth {
 }
 
 pub enum SMsg {
-    Integrations(Vec<Integration>),
+    Integrations(Vec<Integration>, Vec<Local>),
     Mcp(Vec<McpServer>),
     Plugins(Vec<Plugin>),
     Skills(Vec<Skill>),
@@ -101,6 +109,7 @@ enum Op {
     SaveKey(String),
     RemoveCred(String),
     Login(String, String),
+    External(String, String), // (integration, method): borrow a login another program already has
     LoginCode,
     LoginCancel,
     McpToggle(String, bool),
@@ -121,6 +130,7 @@ pub struct SettingsState {
     filter: String,
 
     integrations: Vec<Integration>,
+    locals: Vec<Local>,
     mcp: Vec<McpServer>,
     plugins: Vec<Plugin>,
     skills: Vec<Skill>,
@@ -145,6 +155,7 @@ impl Default for SettingsState {
             dirty: false,
             filter: String::new(),
             integrations: Vec::new(),
+            locals: Vec::new(),
             mcp: Vec::new(),
             plugins: Vec::new(),
             skills: Vec::new(),
@@ -181,7 +192,7 @@ fn fetch_integrations(api: &Api, dir: &str) -> Result<Vec<Integration>, String> 
     let mut out: Vec<Integration> = arr(&v["data"])
         .iter()
         .map(|i| {
-            let mut it = Integration { id: st(i, "id"), name: st(i, "name"), key: false, key_fields: Vec::new(), logins: Vec::new(), env: Vec::new(), conns: Vec::new() };
+            let mut it = Integration { id: st(i, "id"), name: st(i, "name"), key: false, key_fields: Vec::new(), logins: Vec::new(), externals: Vec::new(), env: Vec::new(), conns: Vec::new() };
             for m in arr(&i["methods"]) {
                 match m["type"].as_str() {
                     Some("key") => {
@@ -189,6 +200,7 @@ fn fetch_integrations(api: &Api, dir: &str) -> Result<Vec<Integration>, String> 
                         it.key_fields = fields(&m["form"]);
                     }
                     Some("oauth") => it.logins.push((st(m, "id"), st(m, "label"), fields(&m["form"]))),
+                    Some("external") => it.externals.push((st(m, "id"), st(m, "label"))),
                     Some("env") => it.env = arr(&m["names"]).iter().filter_map(|n| n.as_str().map(str::to_owned)).collect(),
                     _ => {}
                 }
@@ -205,6 +217,20 @@ fn fetch_integrations(api: &Api, dir: &str) -> Result<Vec<Integration>, String> 
         .collect();
     out.sort_by_key(|i| i.name.to_lowercase());
     Ok(out)
+}
+
+// active providers that point at this machine. not worth failing the whole tab over, so errors = none.
+fn fetch_locals(api: &Api, dir: &str) -> Vec<Local> {
+    let Ok(v) = api.get(&format!("/api/provider?{}", location(dir))) else { return Vec::new() };
+    arr(&v["data"])
+        .iter()
+        .filter_map(|p| {
+            let url = p["settings"]["baseURL"].as_str()?;
+            let host = url.split("://").nth(1).unwrap_or(url);
+            let local = ["127.0.0.1", "localhost", "[::1]", "0.0.0.0"].iter().any(|h| host.starts_with(h));
+            local.then(|| Local { id: st(p, "id"), name: st(p, "name"), url: url.to_owned() })
+        })
+        .collect()
 }
 
 fn fetch_mcp(api: &Api, dir: &str) -> Result<Vec<McpServer>, String> {
@@ -282,7 +308,7 @@ impl App {
         let wrap = |r: Result<SMsg, String>| r.map(Msg::Settings).unwrap_or_else(Msg::Err);
         match tab {
             Tab::General => {}
-            Tab::Providers => self.spawn(move |api| wrap(fetch_integrations(api, &dir).map(SMsg::Integrations))),
+            Tab::Providers => self.spawn(move |api| wrap(fetch_integrations(api, &dir).map(|i| SMsg::Integrations(i, fetch_locals(api, &dir))))),
             Tab::Mcp => self.spawn(move |api| wrap(fetch_mcp(api, &dir).map(SMsg::Mcp))),
             Tab::Plugins => self.spawn(move |api| wrap(fetch_plugins(api, &dir).map(SMsg::Plugins))),
             Tab::Skills => self.spawn(move |api| wrap(fetch_skills(api, &dir).map(SMsg::Skills))),
@@ -292,7 +318,10 @@ impl App {
 
     pub fn on_settings(&mut self, m: SMsg) {
         match m {
-            SMsg::Integrations(v) => self.st.integrations = v,
+            SMsg::Integrations(v, l) => {
+                self.st.integrations = v;
+                self.st.locals = l;
+            }
             SMsg::Mcp(v) => self.st.mcp = v,
             SMsg::Plugins(v) => self.st.plugins = v,
             SMsg::Skills(v) => self.st.skills = v,
@@ -367,6 +396,8 @@ impl App {
                     Err(e) => Msg::Err(e),
                 });
             }
+            // nothing to type or wait for: the server just records "use that program's login".
+            Op::External(id, method) => self.mutate("POST", format!("/api/integration/{id}/connect/external?{loc}"), Some(json!({ "methodID": method }))),
             Op::LoginCode => {
                 if let Some(o) = &mut self.st.oauth {
                     let path = format!("/api/integration/{}/connect/oauth/{}/complete?{loc}", o.integration, o.attempt);
@@ -633,6 +664,37 @@ impl App {
             });
         }
 
+        // pinned slots, so the usual suspects don't have to be dug out of the full provider list.
+        section(ui, &p, "Quick connect");
+        if s.integrations.is_empty() {
+            note(ui, &p, "loading providers…");
+        }
+        for pin in &PINNED {
+            pinned_row(ui, &p, pin, &s.integrations, &mut s.editing, &mut s.key_input, &mut s.answers, ops);
+        }
+        note(ui, &p, "a subscription login bills your Claude or ChatGPT plan instead of api credits. the Claude one runs Claude Code in the background, so `claude` has to be installed and logged in.");
+
+        section(ui, &p, "Local models");
+        for l in &s.locals {
+            let n = self.models.iter().filter(|m| m.provider == l.id).count();
+            Sides::new().height(30.0).shrink_left().truncate().show(
+                ui,
+                |ui| {
+                    dot(ui, if n > 0 { p.good } else { p.faint });
+                    ui.label(RichText::new(&l.name).size(14.0).color(p.text));
+                    ui.label(RichText::new(&l.url).font(mono(11.5)).color(p.faint));
+                },
+                |ui| {
+                    ui.label(RichText::new(if n == 1 { "1 model".to_owned() } else { format!("{n} models") }).size(12.5).color(p.dim));
+                },
+            );
+        }
+        if s.locals.is_empty() {
+            note(ui, &p, "no local server active. start ollama and reopen this tab; if it still isn't listed, add it under `providers` in opencode.json.");
+        } else {
+            note(ui, &p, "no key needed. these show up in the model picker like any other model.");
+        }
+
         section(ui, &p, "Connected");
         let mut any = false;
         for i in &s.integrations {
@@ -670,62 +732,7 @@ impl App {
         let matches: Vec<&Integration> = s.integrations.iter().filter(|i| q.is_empty() || i.name.to_lowercase().contains(&q) || i.id.contains(&q)).collect();
         const SHOWN: usize = 40;
         for i in matches.iter().take(SHOWN) {
-            let open = s.editing.as_deref() == Some(i.id.as_str());
-            let mut toggle_open = false;
-            Sides::new().height(30.0).shrink_left().truncate().show(
-                ui,
-                |ui| {
-                    ui.label(RichText::new(&i.name).size(14.0).color(p.text));
-                    if let Some(e) = i.env.first() {
-                        ui.label(RichText::new(format!("${e}")).font(mono(11.5)).color(p.faint)).on_hover_text("also picked up from this environment variable");
-                    }
-                },
-                |ui| {
-                    if i.key || !i.logins.is_empty() {
-                        let label = if open { "Close" } else if i.key { "Add key" } else { "Sign in" };
-                        toggle_open = solid_button(ui, &p, label, false).clicked();
-                    }
-                },
-            );
-            if toggle_open {
-                s.editing = if open { None } else { Some(i.id.clone()) };
-                s.key_input.clear();
-                s.answers.clear();
-            }
-            if !open {
-                continue;
-            }
-            Frame::new().fill(p.inset).corner_radius(10).inner_margin(12).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                let extra: Vec<&Field> = i.key_fields.iter().chain(i.logins.iter().flat_map(|l| l.2.iter())).collect();
-                let mut seen: Vec<&str> = Vec::new();
-                for f in extra {
-                    if seen.contains(&f.key.as_str()) || f.kind == "external" {
-                        continue;
-                    }
-                    seen.push(&f.key);
-                    let title = if f.title.is_empty() { f.key.clone() } else { f.title.clone() };
-                    ui.label(RichText::new(title).size(13.0).color(p.dim));
-                    let val = s.answers.entry(f.key.clone()).or_default();
-                    field_box(ui, &p, |ui| ui.add(TextEdit::singleline(val).frame(Frame::NONE).desired_width(f32::INFINITY)));
-                }
-                if i.key {
-                    field_box(ui, &p, |ui| {
-                        ui.add(TextEdit::singleline(&mut s.key_input).password(true).frame(Frame::NONE).desired_width(f32::INFINITY).hint_text(RichText::new("paste api key").color(p.faint)))
-                    });
-                }
-                ui.horizontal_wrapped(|ui| {
-                    if i.key && solid_button(ui, &p, "Save key", true).clicked() && !s.key_input.trim().is_empty() {
-                        ops.push(Op::SaveKey(i.id.clone()));
-                    }
-                    for (method, label, _) in &i.logins {
-                        if solid_button(ui, &p, label, !i.key).clicked() {
-                            ops.push(Op::Login(i.id.clone(), method.clone()));
-                        }
-                    }
-                });
-                note(ui, &p, "keys are sent straight to your local opencode server, which stores them. cloverleaf doesn't keep a copy.");
-            });
+            provider_row(ui, &p, i, &mut s.editing, &mut s.key_input, &mut s.answers, ops);
         }
         if matches.len() > SHOWN {
             note(ui, &p, &format!("…and {} more. type to narrow it down.", matches.len() - SHOWN));
@@ -871,6 +878,162 @@ impl App {
 }
 
 // ---------------------------------------------------------------- widgets
+
+// a pinned slot at the top of the providers tab. one slot can front two integrations on the
+// server: the one that takes an api key, and the one that logs in with a subscription.
+struct Pin {
+    title: &'static str,
+    key: &'static str,                                        // integration that takes the api key
+    sub: Option<(&'static str, &'static str, &'static str)>, // (integration, method id, button label)
+}
+
+const PINNED: [Pin; 3] = [
+    Pin { title: "Claude", key: "anthropic", sub: Some(("claude-agent", "claude-login", "Use Claude Code login")) },
+    Pin { title: "Codex", key: "openai", sub: Some(("openai", "chatgpt-token-sharing", "Sign in with ChatGPT")) },
+    Pin { title: "Ollama", key: "ollama-cloud", sub: None },
+];
+
+#[allow(clippy::too_many_arguments)]
+fn pinned_row(ui: &mut Ui, p: &Pal, pin: &Pin, all: &[Integration], editing: &mut Option<String>, key_input: &mut String, answers: &mut HashMap<String, String>, ops: &mut Vec<Op>) {
+    let key_i = all.iter().find(|i| i.id == pin.key);
+    let sub_i = pin.sub.and_then(|(id, _, _)| all.iter().find(|i| i.id == id));
+    if key_i.is_none() && sub_i.is_none() {
+        return; // this opencode doesn't know the provider
+    }
+
+    // how it's connected right now, across both integrations.
+    let mut how: Vec<&str> = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
+    for i in key_i.iter().chain(sub_i.iter()) {
+        if seen.contains(&i.id.as_str()) {
+            continue; // key and subscription can live on the same integration (openai)
+        }
+        seen.push(&i.id);
+        for c in &i.conns {
+            let h = match c.method.as_str() {
+                "key" => "api key",
+                "env" => "key from env",
+                _ => "subscription",
+            };
+            if !how.contains(&h) {
+                how.push(h);
+            }
+        }
+    }
+    let status = how.join(" + "); // empty = not connected: the grey dot says so, and the buttons need the room
+
+    // the subscription button: only if the server really offers that method and it isn't connected yet.
+    let sub_op = pin.sub.zip(sub_i).filter(|_| !how.contains(&"subscription")).and_then(|((id, method, label), i)| {
+        if i.externals.iter().any(|m| m.0 == method) {
+            Some((label, Op::External(id.to_owned(), method.to_owned())))
+        } else if i.logins.iter().any(|l| l.0 == method) {
+            Some((label, Op::Login(id.to_owned(), method.to_owned())))
+        } else {
+            None
+        }
+    });
+
+    let slot = format!("pin/{}", pin.key);
+    let open = editing.as_deref() == Some(slot.as_str());
+    let mut toggle_open = false;
+    Sides::new().height(30.0).shrink_left().truncate().show(
+        ui,
+        |ui| {
+            dot(ui, if how.is_empty() { p.faint } else { p.good });
+            ui.label(RichText::new(pin.title).size(14.0).color(p.text));
+            ui.label(RichText::new(&status).size(12.5).color(p.faint));
+        },
+        |ui| {
+            // right-to-left: the key button ends up rightmost.
+            if key_i.is_some_and(|i| i.key) {
+                toggle_open = solid_button(ui, p, if open { "Close" } else { "Add key" }, false).clicked();
+            }
+            if let Some((label, op)) = sub_op
+                && solid_button(ui, p, label, false).clicked()
+            {
+                ops.push(op);
+            }
+        },
+    );
+    if toggle_open {
+        *editing = if open { None } else { Some(slot) };
+        key_input.clear();
+        answers.clear();
+    }
+    if open && let Some(i) = key_i {
+        connect_form(ui, p, i, &[], key_input, answers, ops);
+    }
+}
+
+// one line of the full provider list, with its "add key / sign in" form underneath while it's open.
+fn provider_row(ui: &mut Ui, p: &Pal, i: &Integration, editing: &mut Option<String>, key_input: &mut String, answers: &mut HashMap<String, String>, ops: &mut Vec<Op>) {
+    let open = editing.as_deref() == Some(i.id.as_str());
+    let mut toggle_open = false;
+    let mut external = false;
+    Sides::new().height(30.0).shrink_left().truncate().show(
+        ui,
+        |ui| {
+            ui.label(RichText::new(&i.name).size(14.0).color(p.text));
+            if let Some(e) = i.env.first() {
+                ui.label(RichText::new(format!("${e}")).font(mono(11.5)).color(p.faint)).on_hover_text("also picked up from this environment variable");
+            }
+        },
+        |ui| {
+            if i.key || !i.logins.is_empty() {
+                let label = if open { "Close" } else if i.key { "Add key" } else { "Sign in" };
+                toggle_open = solid_button(ui, p, label, false).clicked();
+            } else if let Some((_, label)) = i.externals.first() {
+                external = solid_button(ui, p, "Connect", false).on_hover_text(label).clicked();
+            }
+        },
+    );
+    if external && let Some((method, _)) = i.externals.first() {
+        ops.push(Op::External(i.id.clone(), method.clone()));
+    }
+    if toggle_open {
+        *editing = if open { None } else { Some(i.id.clone()) };
+        key_input.clear();
+        answers.clear();
+    }
+    if open {
+        connect_form(ui, p, i, &i.logins, key_input, answers, ops);
+    }
+}
+
+// the box under an open row: extra questions, the key field, and a button per login method in `logins`.
+fn connect_form(ui: &mut Ui, p: &Pal, i: &Integration, logins: &[(String, String, Vec<Field>)], key_input: &mut String, answers: &mut HashMap<String, String>, ops: &mut Vec<Op>) {
+    Frame::new().fill(p.inset).corner_radius(10).inner_margin(12).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let extra: Vec<&Field> = i.key_fields.iter().chain(logins.iter().flat_map(|l| l.2.iter())).collect();
+        let mut seen: Vec<&str> = Vec::new();
+        for f in extra {
+            if seen.contains(&f.key.as_str()) || f.kind == "external" {
+                continue;
+            }
+            seen.push(&f.key);
+            let title = if f.title.is_empty() { f.key.clone() } else { f.title.clone() };
+            ui.label(RichText::new(title).size(13.0).color(p.dim));
+            let val = answers.entry(f.key.clone()).or_default();
+            field_box(ui, p, |ui| ui.add(TextEdit::singleline(val).frame(Frame::NONE).desired_width(f32::INFINITY)));
+        }
+        if i.key {
+            field_box(ui, p, |ui| {
+                ui.add(TextEdit::singleline(key_input).password(true).frame(Frame::NONE).desired_width(f32::INFINITY).hint_text(RichText::new("paste api key").color(p.faint)))
+            });
+        }
+        ui.horizontal_wrapped(|ui| {
+            if i.key && solid_button(ui, p, "Save key", true).clicked() && !key_input.trim().is_empty() {
+                ops.push(Op::SaveKey(i.id.clone()));
+            }
+            for (method, label, _) in logins {
+                if solid_button(ui, p, label, !i.key).clicked() {
+                    ops.push(Op::Login(i.id.clone(), method.clone()));
+                }
+            }
+        });
+        note(ui, p, "keys are sent straight to your local opencode server, which stores them. cloverleaf doesn't keep a copy.");
+    });
+}
 
 fn dot(ui: &mut Ui, col: Color32) {
     let (r, _) = ui.allocate_exact_size(vec2(10.0, 18.0), Sense::hover());
