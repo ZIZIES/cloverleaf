@@ -23,6 +23,11 @@ status: early, but usable day to day. linux/wayland is what it's built and teste
 - command palette for everything
 - settings: accent color, window opacity, ui scale, provider keys and browser logins, mcp servers,
   plugins, skills, saved permissions
+- quick connect for claude and openai (api key, or your subscription login) and ollama cloud
+- custom providers: add any server that speaks the openai api with a name, a url and a key
+- tok/s next to the context meter
+- local models: download, remove and unload ollama models, with each one marked as fitting in
+  vram, needing vram + ram, or too big for your machine
 - real window transparency, so compositor blur (hyprland etc) shows through the background while
   text stays solid
 
@@ -56,6 +61,8 @@ cargo build --release
 
 - `~/.config/cloverleaf/state.json`: cloverleaf's own settings (accent, opacity, scale, default
   model/agent, mcp servers you added from the settings window). nothing secret goes in here.
+- `~/.config/cloverleaf/providers.json`: custom providers, only exists once you add one. this one
+  does hold their api keys, see below.
 - everything else (sessions, api keys, providers, plugins) belongs to opencode and stays where
   opencode keeps it.
 
@@ -65,8 +72,19 @@ cloverleaf never stores your keys and never reads them back. a key you paste in 
 once to the opencode server on your own machine, which stores it, and is wiped from the ui. the
 providers tab only asks the server whether something is connected.
 
+the one exception is a custom provider you add yourself. opencode's key store only holds keys for
+providers it knows, so that key is kept by cloverleaf, in `~/.config/cloverleaf/providers.json`
+(mode 0600), next to the provider's url and model list. the file is passed to the opencode server
+at launch and never read back into the ui.
+
 the server cloverleaf spawns listens on `127.0.0.1` on a random port with a random password made
 fresh each launch, and is killed when the window closes.
+
+### what it talks to
+
+only the opencode server on your machine, with one exception: the local models tab. that one
+talks to your ollama server directly, and makes plain anonymous requests to `ollama.com` (the
+list of models) and `registry.ollama.ai` (download sizes). nothing is sent until you open the tab.
 
 ## env vars
 
@@ -80,7 +98,9 @@ scripted testing, see `debug_hooks` in `src/app.rs`.
 
 ## code map
 
-about 4k lines, plain threads and channels, no async runtime.
+about 5k lines, plain threads and channels, no async runtime. `cargo test` runs the offline tests,
+`cargo test -- --ignored` also checks the ollama.com scraper, does a real (tiny) pull + delete, and
+round-trips a custom provider against your local ollama.
 
 | file | what |
 | --- | --- |
@@ -91,6 +111,8 @@ about 4k lines, plain threads and channels, no async runtime.
 | `src/app.rs` | state, event handling, actions |
 | `src/ui.rs` | drawing: sidebar, transcript, composer, palette |
 | `src/settings.rs` | the settings window |
+| `src/ollama.rs` | its local models tab: talks to ollama, works out what fits |
+| `src/custom.rs` | custom openai-compatible providers and the file they live in |
 | `src/theme.rs`, `src/logo.rs` | palette + fonts, the clover |
 
 opencode's http api is marked experimental upstream. this was written against opencode 2.2.5 and

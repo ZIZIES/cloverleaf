@@ -7,12 +7,16 @@
 //   app.rs     state, event handling, actions
 //   ui.rs      drawing
 //   settings.rs  the settings window (keys, mcp, plugins, ...)
+//   custom.rs  custom openai-compatible providers, kept in a config file of our own
+//   ollama.rs  its "local models" tab: download + manage ollama models, what fits in vram
 //   theme.rs   palette + fonts,  logo.rs  the clover
 
 mod api;
 mod app;
+mod custom;
 mod logo;
 mod model;
+mod ollama;
 mod server;
 mod settings;
 mod theme;

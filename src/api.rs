@@ -4,6 +4,8 @@
 use crate::model::*;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
@@ -162,9 +164,13 @@ impl Api {
         Session::parse(&v["data"]).ok_or_else(|| "server returned a session i couldn't parse".to_owned())
     }
 
-    // server-sent events: one long GET, one json object per `data:` line. reconnects forever.
-    pub fn event_loop(&self, tx: Sender<Msg>, ctx: egui::Context) {
+    // server-sent events: one long GET, one json object per `data:` line. reconnects forever,
+    // until `stop` is set (the app swapped this server for a new one and started a new loop).
+    pub fn event_loop(&self, tx: Sender<Msg>, ctx: egui::Context, stop: Arc<AtomicBool>) {
         loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
             let res = self.agent.get(format!("{}/api/event", self.base)).header("Authorization", &self.auth).call();
             if let Ok(res) = res
                 && res.status().as_u16() < 400
@@ -174,6 +180,9 @@ impl Api {
                 let reader = BufReader::new(res.into_body().into_reader());
                 for line in reader.lines() {
                     let Ok(line) = line else { break };
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
                     let Some(data) = line.strip_prefix("data:") else { continue };
                     if let Ok(v) = serde_json::from_str::<Value>(data.trim()) {
                         if tx.send(Msg::Event(v)).is_err() {
@@ -183,7 +192,8 @@ impl Api {
                     }
                 }
             }
-            if tx.send(Msg::Sse(false)).is_err() {
+            // a stopped loop must not report "disconnected" over the new one's "connected".
+            if stop.load(Ordering::Relaxed) || tx.send(Msg::Sse(false)).is_err() {
                 return;
             }
             ctx.request_repaint();

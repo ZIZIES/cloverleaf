@@ -26,12 +26,19 @@ impl Server {
             .port();
         let pw = random_hex(24);
 
-        let child = Command::new("opencode")
-            .args(["serve", "--hostname", "127.0.0.1", "--port", &port.to_string()])
+        let mut cmd = Command::new("opencode");
+        cmd            .args(["serve", "--hostname", "127.0.0.1", "--port", &port.to_string()])
             .env("OPENCODE_SERVER_PASSWORD", &pw)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        // custom providers live in a config document of our own (see custom.rs), which opencode reads
+        // on top of its normal ones. if you've pointed OPENCODE_CONFIG somewhere yourself, yours wins.
+        let extra = crate::custom::path();
+        if extra.exists() && std::env::var_os("OPENCODE_CONFIG").is_none() {
+            cmd.env("OPENCODE_CONFIG", extra);
+        }
+        let child = cmd
             .spawn()
             .map_err(|e| format!("couldn't run `opencode serve` ({e}). is opencode on your PATH?"))?;
 

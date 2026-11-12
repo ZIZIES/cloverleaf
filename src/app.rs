@@ -8,6 +8,8 @@ use crate::theme::{self, Pal};
 use egui_commonmark::CommonMarkCache;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -114,9 +116,24 @@ pub struct App {
 
     pub shot: Option<(String, f64)>, // debug: screenshot path + when to take it
     pub shot_sent: bool,
+    sse_stop: Arc<AtomicBool>, // tells the event-stream thread to quit. set when the server is replaced
+    hooks_done: bool,          // debug hooks run once, not again after a server restart
+    quiet_until: f64,          // no error toasts before this: requests still in the air when the server was restarted all fail
+
+    // tok/s. the clock for a step starts at its first streamed chunk and stops at step.ended.
+    stream: Option<Stream>,
+    tps: HashMap<String, f32>, // session id -> speed of its last measured step
 }
 
-fn state_path() -> std::path::PathBuf {
+// the step that's streaming right now.
+struct Stream {
+    mid: String, // assistant message it belongs to
+    first: f64,  // server time of the first chunk, ms
+    last: f64,   // ... and of the latest one
+    chars: usize, // text received so far, for the live estimate
+}
+
+pub(crate) fn state_path() -> std::path::PathBuf {
     let base = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{}/.config", std::env::var("HOME").unwrap_or_default()));
     std::path::PathBuf::from(base).join("cloverleaf/state.json")
 }
@@ -206,6 +223,11 @@ impl App {
             rail: None,
             shot: std::env::var("CLOVERLEAF_SHOT").ok().map(|p| (p, std::env::var("CLOVERLEAF_SHOT_AFTER").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0))),
             shot_sent: false,
+            sse_stop: Arc::new(AtomicBool::new(false)),
+            hooks_done: false,
+            quiet_until: 0.0,
+            stream: None,
+            tps: HashMap::new(),
         };
 
         if app.fatal.is_none() {
@@ -224,6 +246,37 @@ impl App {
             let _ = tx.send(f(&api));
             ctx.request_repaint();
         });
+    }
+
+    // for threads that report more than once (a download's progress): the raw way into pump().
+    pub fn channel(&self) -> (Sender<Msg>, egui::Context) {
+        (self.tx.clone(), self.ctx.clone())
+    }
+
+    // kill the opencode server and start a fresh one. the only way to make it reread its config,
+    // which is how custom providers get in (custom.rs). anything that was running is stopped.
+    pub fn restart_server(&mut self) {
+        self.sse_stop.store(true, Ordering::Relaxed);
+        self._server = None; // drop = SIGTERM and wait for it to go (up to a second)
+        self.ready = false;
+        self.sse = false;
+        self.busy.clear();
+        self.perms.clear();
+        self.forms.clear();
+        self.mcp_applied.clear(); // the new server hasn't been given our mcp servers yet
+        self.stream = None;
+        self.quiet_until = self.now() + 4.0;
+        match Server::start() {
+            Ok(s) => {
+                self.api = Api::new(&s.base, &s.auth);
+                self._server = Some(s);
+                self.spawn(|api| match api.wait_ready() {
+                    Ok(()) => Msg::Ready,
+                    Err(e) => Msg::Fatal(e),
+                });
+            }
+            Err(e) => self.fatal = Some(e),
+        }
     }
 
     // fire a request where the only interesting outcome is failure.
@@ -319,8 +372,13 @@ impl App {
                     self.reload_sessions();
                     self.reload_meta();
                     let (api, tx, ctx) = (self.api.clone(), self.tx.clone(), self.ctx.clone());
-                    std::thread::spawn(move || api.event_loop(tx, ctx));
-                    self.debug_hooks();
+                    let stop = Arc::new(AtomicBool::new(false));
+                    self.sse_stop = stop.clone();
+                    std::thread::spawn(move || api.event_loop(tx, ctx, stop));
+                    self.st.dirty = true; // an open settings tab should refetch from the (maybe new) server
+                    if !std::mem::replace(&mut self.hooks_done, true) {
+                        self.debug_hooks();
+                    }
                 }
                 Msg::Fatal(e) => self.fatal = Some(e),
                 Msg::Sessions(mut list) => {
@@ -374,6 +432,7 @@ impl App {
                     self.sse = up;
                 }
                 Msg::Settings(m) => self.on_settings(m),
+                Msg::Err(e) if self.now() < self.quiet_until => eprintln!("cloverleaf: (during restart) {e}"),
                 Msg::Err(e) => self.error(e),
                 Msg::Nop => {}
             }
@@ -405,6 +464,11 @@ impl App {
             self.settings_open = true;
             self.st.tab = match tab.as_str() {
                 "providers" => Tab::Providers,
+                "ollama" => Tab::Ollama,
+                "custom" => {
+                    self.st.open_custom_form();
+                    Tab::Providers
+                }
                 "mcp" => Tab::Mcp,
                 "plugins" => Tab::Plugins,
                 "skills" => Tab::Skills,
@@ -412,8 +476,12 @@ impl App {
                 _ => Tab::General,
             };
         }
+        if std::env::var("CLOVERLEAF_RESTART").is_ok() {
+            self.restart_server(); // exercise the restart path: the app should come back up by itself
+        }
         match std::env::var("CLOVERLEAF_PALETTE").as_deref() {
             Ok("models") => self.run(Action::Palette(PaletteMode::Models)),
+            Ok("agents") => self.run(Action::Palette(PaletteMode::Agents)),
             Ok(_) => self.run(Action::Palette(PaletteMode::All)),
             Err(_) => {}
         }
@@ -476,6 +544,19 @@ impl App {
         let ord = d["ordinal"].as_u64().unwrap_or(0) as usize;
         let tid = d["id"].as_str().unwrap_or("");
 
+        // tok/s bookkeeping: every streamed chunk of text, thinking or tool arguments counts.
+        if t.ends_with(".delta") {
+            let at = e["created"].as_f64().unwrap_or(0.0);
+            let n = d["delta"].as_str().map(str::len).unwrap_or(0);
+            match &mut self.stream {
+                Some(s) if s.mid == mid => {
+                    s.chars += n;
+                    s.last = at;
+                }
+                _ => self.stream = Some(Stream { mid: mid.to_owned(), first: at, last: at, chars: n }),
+            }
+        }
+
         match t {
             // things that change the transcript in ways we don't model incrementally: just refetch.
             "session.inbox.delivered" | "session.step.failed" | "session.compaction.started" | "session.compaction.ended" | "session.compaction.failed"
@@ -489,6 +570,17 @@ impl App {
                 }
             }
             "session.step.ended" => {
+                // real numbers now: the tokens the provider counted, over the time the step spent streaming.
+                // some providers count thinking inside `output`, some next to it, so add both.
+                if let Some(s) = self.stream.take()
+                    && s.mid == mid
+                {
+                    let out = d["tokens"]["output"].as_f64().unwrap_or(0.0) + d["tokens"]["reasoning"].as_f64().unwrap_or(0.0);
+                    let secs = (e["created"].as_f64().unwrap_or(0.0) - s.first) / 1000.0;
+                    if out > 0.0 && secs > 0.2 {
+                        self.tps.insert(sid.to_owned(), (out / secs) as f32);
+                    }
+                }
                 if let Item::Assistant { context, done, .. } = self.assistant(mid) {
                     *context = context_tokens(&d["tokens"]);
                     *done = true;
@@ -632,6 +724,21 @@ impl App {
             None => self.new_agent.clone(),
         };
         picked.or_else(|| self.agents.first().map(|a| a.id.clone())).unwrap_or_else(|| "build".to_owned())
+    }
+
+    // generation speed to show for the active session: (tokens per second, is it a live estimate).
+    // live = while a step streams, guessed from the text so far at ~4 characters per token.
+    // otherwise the last finished step's real figure. None if nothing was measured this run:
+    // old messages only record when they started and ended, which includes waiting for the first token.
+    pub fn tok_rate(&self) -> Option<(f32, bool)> {
+        let sid = self.active.as_ref()?;
+        if let Some(s) = &self.stream
+            && self.busy.contains(sid)
+            && s.last - s.first > 1000.0
+        {
+            return Some(((s.chars as f64 / 4.0 / ((s.last - s.first) / 1000.0)) as f32, true));
+        }
+        self.tps.get(sid).map(|r| (*r, false))
     }
 
     // tokens in the context window after the latest step.

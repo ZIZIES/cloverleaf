@@ -706,6 +706,11 @@ impl App {
                         let text = if limit > 0 { format!("{} · {}%", kilo(used), (used * 100 / limit).min(100)) } else { kilo(used) };
                         ui.label(RichText::new(text).size(12.0).color(p.faint)).on_hover_text("context window used");
                     }
+                    if let Some((rate, live)) = self.tok_rate() {
+                        ui.add_space(6.0);
+                        let text = format!("{}{rate:.0} tok/s", if live { "~" } else { "" });
+                        ui.label(RichText::new(text).size(12.0).color(p.faint)).on_hover_text("generation speed of the last step: output tokens over the time it spent streaming. ~ means a live estimate");
+                    }
                 });
             });
         });
@@ -822,7 +827,9 @@ impl App {
         let mut chosen: Option<Action> = None;
         let frame = Frame::new().fill(p.panel).stroke(Stroke::new(1.0, p.line)).corner_radius(14).inner_margin(10);
         let res = egui::Modal::new(Id::unique("palette")).frame(frame).backdrop_color(Color32::from_black_alpha(130)).show(ctx, |ui| {
-            ui.set_width(560.0_f32.min(ctx.content_rect().width() - 40.0));
+            // the agent list is a handful of entries: a small box that fits them, not the full-size palette.
+            let small = pl.mode == PaletteMode::Agents;
+            ui.set_width((if small { 340.0_f32 } else { 560.0 }).min(ctx.content_rect().width() - 40.0));
             let (up, down, enter) = ui.input_mut(|i| {
                 (i.consume_key(Modifiers::NONE, Key::ArrowUp), i.consume_key(Modifiers::NONE, Key::ArrowDown), i.consume_key(Modifiers::NONE, Key::Enter))
             });
@@ -849,8 +856,10 @@ impl App {
             ui.painter().rect_filled(line, 0, p.line_soft);
             ui.add_space(4.0);
 
-            ScrollArea::vertical().max_height(372.0).auto_shrink([false, false]).show(ui, |ui| {
-                ui.set_min_height(372.0);
+            ScrollArea::vertical().max_height(372.0).auto_shrink([false, small]).show(ui, |ui| {
+                if !small {
+                    ui.set_min_height(372.0); // fixed height, so the box doesn't jump around while you type
+                }
                 ui.spacing_mut().item_spacing.y = 2.0;
                 if entries.is_empty() {
                     ui.add_space(8.0);
@@ -862,7 +871,8 @@ impl App {
                     if sel || resp.hovered() {
                         ui.painter().rect_filled(r, 8, if sel { p.raised } else { p.line_soft });
                     }
-                    let g = ui.painter().layout_no_wrap(hint.clone(), sans(12.5), p.faint);
+                    // no room for the description in the small box: it'd show up as a chopped-off tail.
+                    let g = ui.painter().layout_no_wrap(if small { String::new() } else { hint.clone() }, sans(12.5), p.faint);
                     let hx = r.right() - 10.0 - g.size().x;
                     let clip = Rect::from_min_max(r.min, pos2((hx - 10.0).max(r.left() + 120.0), r.bottom()));
                     ui.painter().with_clip_rect(clip).text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, label, sans(14.0), p.text);

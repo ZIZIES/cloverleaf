@@ -14,15 +14,17 @@ use std::collections::HashMap;
 pub enum Tab {
     General,
     Providers,
+    Ollama,
     Mcp,
     Plugins,
     Skills,
     Permissions,
 }
 
-const TABS: [(Tab, &str); 6] = [
+const TABS: [(Tab, &str); 7] = [
     (Tab::General, "General"),
     (Tab::Providers, "Providers & keys"),
+    (Tab::Ollama, "Local models"),
     (Tab::Mcp, "MCP servers"),
     (Tab::Plugins, "Plugins"),
     (Tab::Skills, "Skills"),
@@ -102,6 +104,8 @@ pub enum SMsg {
     Changed, // a write went through: refetch
     OAuth(OAuth),
     OAuthStatus(String, String), // (status, message)
+    Ollama(crate::ollama::OMsg),  // the local models tab keeps its own messages, see ollama.rs
+    Custom(Result<(), String>),   // the custom providers file was changed (or couldn't be)
 }
 
 // things the tabs want done. collected while drawing, executed after.
@@ -110,6 +114,9 @@ enum Op {
     RemoveCred(String),
     Login(String, String),
     External(String, String), // (integration, method): borrow a login another program already has
+    CustomAdd,
+    CustomRemove(String),
+    CustomRefresh(String),
     LoginCode,
     LoginCancel,
     McpToggle(String, bool),
@@ -144,6 +151,17 @@ pub struct SettingsState {
     mcp_name: String,
     mcp_target: String,
     show_builtin: bool,
+    pub ol: crate::ollama::OllamaState,
+
+    // custom openai-compatible providers (custom.rs) and the form that adds one
+    customs: Vec<crate::custom::Custom>,
+    c_open: bool,
+    c_name: String,
+    c_url: String,
+    c_key: String,
+    c_models: String,
+    c_busy: bool,
+    c_error: String,
 }
 
 impl Default for SettingsState {
@@ -168,7 +186,23 @@ impl Default for SettingsState {
             mcp_name: String::new(),
             mcp_target: String::new(),
             show_builtin: false,
+            ol: Default::default(),
+            customs: Vec::new(),
+            c_open: false,
+            c_name: String::new(),
+            c_url: String::new(),
+            c_key: String::new(),
+            c_models: String::new(),
+            c_busy: false,
+            c_error: String::new(),
         }
+    }
+}
+
+impl SettingsState {
+    // for the CLOVERLEAF_SETTINGS=custom debug hook.
+    pub fn open_custom_form(&mut self) {
+        self.c_open = true;
     }
 }
 
@@ -308,7 +342,11 @@ impl App {
         let wrap = |r: Result<SMsg, String>| r.map(Msg::Settings).unwrap_or_else(Msg::Err);
         match tab {
             Tab::General => {}
-            Tab::Providers => self.spawn(move |api| wrap(fetch_integrations(api, &dir).map(|i| SMsg::Integrations(i, fetch_locals(api, &dir))))),
+            Tab::Providers => {
+                self.st.customs = crate::custom::list();
+                self.spawn(move |api| wrap(fetch_integrations(api, &dir).map(|i| SMsg::Integrations(i, fetch_locals(api, &dir)))))
+            }
+            Tab::Ollama => self.ollama_load(),
             Tab::Mcp => self.spawn(move |api| wrap(fetch_mcp(api, &dir).map(SMsg::Mcp))),
             Tab::Plugins => self.spawn(move |api| wrap(fetch_plugins(api, &dir).map(SMsg::Plugins))),
             Tab::Skills => self.spawn(move |api| wrap(fetch_skills(api, &dir).map(SMsg::Skills))),
@@ -329,6 +367,21 @@ impl App {
             SMsg::Changed => {
                 self.st.loaded = None; // refetch the open tab right away
                 self.meta_dirty = true; // a new key means new models
+            }
+            SMsg::Ollama(m) => self.on_ollama(m),
+            SMsg::Custom(Ok(())) => {
+                let s = &mut self.st;
+                s.c_busy = false;
+                s.c_open = false;
+                for f in [&mut s.c_name, &mut s.c_url, &mut s.c_key, &mut s.c_models, &mut s.c_error] {
+                    f.clear();
+                }
+                s.customs = crate::custom::list();
+                self.restart_server(); // opencode only reads that file when it starts
+            }
+            SMsg::Custom(Err(e)) => {
+                self.st.c_busy = false;
+                if self.st.c_open { self.st.c_error = e } else { self.error(e) }
             }
             SMsg::OAuth(o) => self.st.oauth = Some(o),
             SMsg::OAuthStatus(status, message) => match status.as_str() {
@@ -398,6 +451,20 @@ impl App {
             }
             // nothing to type or wait for: the server just records "use that program's login".
             Op::External(id, method) => self.mutate("POST", format!("/api/integration/{id}/connect/external?{loc}"), Some(json!({ "methodID": method }))),
+            Op::CustomAdd => {
+                let s = &mut self.st;
+                if s.c_busy {
+                    return;
+                }
+                s.c_busy = true;
+                s.c_error.clear();
+                // the key stays in the form until this works, so a typo in the url doesn't cost you a re-paste.
+                let (name, url, key, models) = (s.c_name.clone(), s.c_url.clone(), s.c_key.clone(), s.c_models.clone());
+                let taken: Vec<String> = s.integrations.iter().map(|i| i.id.clone()).collect();
+                self.spawn(move |_| Msg::Settings(SMsg::Custom(crate::custom::add(&name, &url, &key, &models, &taken))));
+            }
+            Op::CustomRemove(id) => self.spawn(move |_| Msg::Settings(SMsg::Custom(crate::custom::remove(&id)))),
+            Op::CustomRefresh(id) => self.spawn(move |_| Msg::Settings(SMsg::Custom(crate::custom::refresh(&id)))),
             Op::LoginCode => {
                 if let Some(o) = &mut self.st.oauth {
                     let path = format!("/api/integration/{}/connect/oauth/{}/complete?{loc}", o.integration, o.attempt);
@@ -533,6 +600,7 @@ impl App {
                             match self.st.tab {
                                 Tab::General => self.tab_general(ui, &mut ops),
                                 Tab::Providers => self.tab_providers(ui, &mut ops),
+                                Tab::Ollama => self.tab_ollama(ui),
                                 Tab::Mcp => self.tab_mcp(ui, &mut ops),
                                 Tab::Plugins => self.tab_plugins(ui, &mut ops),
                                 Tab::Skills => self.tab_skills(ui),
@@ -672,6 +740,64 @@ impl App {
         for pin in &PINNED {
             pinned_row(ui, &p, pin, &s.integrations, &mut s.editing, &mut s.key_input, &mut s.answers, ops);
         }
+        // custom slots: any other server that speaks the openai api.
+        for c in &s.customs {
+            Sides::new().height(30.0).shrink_left().truncate().show(
+                ui,
+                |ui| {
+                    dot(ui, p.good);
+                    ui.label(RichText::new(&c.name).size(14.0).color(p.text));
+                    ui.label(RichText::new(&c.url).font(mono(11.5)).color(p.faint));
+                },
+                |ui| {
+                    if confirm_button(ui, &p, &mut s.confirm, &format!("custom/{}", c.id), "Remove") {
+                        ops.push(Op::CustomRemove(c.id.clone()));
+                    }
+                    if solid_button(ui, &p, "Refresh", false).on_hover_text("ask it for its model list again").clicked() {
+                        ops.push(Op::CustomRefresh(c.id.clone()));
+                    }
+                    ui.label(RichText::new(if c.models == 1 { "1 model".to_owned() } else { format!("{} models", c.models) }).size(12.5).color(p.dim));
+                },
+            );
+        }
+        // they get to the server through a config file handed over at launch, so cloverleaf has to be the one launching it.
+        let blocked = std::env::var_os("CLOVERLEAF_SERVER").is_some() || std::env::var_os("OPENCODE_CONFIG").is_some();
+        if blocked {
+            note(ui, &p, "custom providers are off: cloverleaf passes them to the opencode server it launches, and here it's attached to an outside one (CLOVERLEAF_SERVER) or OPENCODE_CONFIG is already set.");
+        } else if !s.c_open {
+            if solid_button(ui, &p, "Add custom provider", false).on_hover_text("any server that speaks the openai api").clicked() {
+                s.c_open = true;
+            }
+        } else {
+            Frame::new().fill(p.inset).corner_radius(10).inner_margin(12).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let line = |ui: &mut Ui, val: &mut String, hint: &str, secret: bool| {
+                    field_box(ui, &p, |ui| ui.add(TextEdit::singleline(val).password(secret).frame(Frame::NONE).desired_width(f32::INFINITY).hint_text(RichText::new(hint).color(p.faint))));
+                };
+                line(ui, &mut s.c_name, "name", false);
+                line(ui, &mut s.c_url, "base url, like https://host/v1", false);
+                line(ui, &mut s.c_key, "api key (leave empty if it doesn't want one)", true);
+                line(ui, &mut s.c_models, "models, comma separated (leave empty to ask the server)", false);
+                if !s.c_error.is_empty() {
+                    ui.add(Label::new(RichText::new(&s.c_error).size(13.0).color(p.err)).wrap());
+                }
+                ui.horizontal(|ui| {
+                    if solid_button(ui, &p, "Add provider", true).clicked() && !s.c_name.trim().is_empty() && !s.c_url.trim().is_empty() {
+                        ops.push(Op::CustomAdd);
+                    }
+                    if solid_button(ui, &p, "Cancel", false).clicked() {
+                        s.c_open = false;
+                        s.c_key.clear();
+                        s.c_error.clear();
+                    }
+                    if s.c_busy {
+                        ui.label(RichText::new("checking…").size(12.5).color(p.faint));
+                    }
+                });
+                note(ui, &p, "for anything that speaks the openai api. adding or removing one restarts the opencode server, which stops whatever is running. unlike the slots above, this key is kept by cloverleaf itself, in ~/.config/cloverleaf/providers.json (readable only by you): opencode's key store can't hold keys for providers it doesn't know.");
+            });
+        }
+
         note(ui, &p, "a subscription login bills your Claude or ChatGPT plan instead of api credits. the Claude one runs Claude Code in the background, so `claude` has to be installed and logged in.");
 
         section(ui, &p, "Local models");
@@ -889,7 +1015,7 @@ struct Pin {
 
 const PINNED: [Pin; 3] = [
     Pin { title: "Claude", key: "anthropic", sub: Some(("claude-agent", "claude-login", "Use Claude Code login")) },
-    Pin { title: "Codex", key: "openai", sub: Some(("openai", "chatgpt-token-sharing", "Sign in with ChatGPT")) },
+    Pin { title: "OpenAI", key: "openai", sub: Some(("openai", "chatgpt-token-sharing", "Sign in with ChatGPT")) },
     Pin { title: "Ollama", key: "ollama-cloud", sub: None },
 ];
 
@@ -1035,17 +1161,17 @@ fn connect_form(ui: &mut Ui, p: &Pal, i: &Integration, logins: &[(String, String
     });
 }
 
-fn dot(ui: &mut Ui, col: Color32) {
+pub(crate) fn dot(ui: &mut Ui, col: Color32) {
     let (r, _) = ui.allocate_exact_size(vec2(10.0, 18.0), Sense::hover());
     ui.painter().circle_filled(r.center(), 3.5, col);
 }
 
-fn field_box<R>(ui: &mut Ui, p: &Pal, add: impl FnOnce(&mut Ui) -> R) -> R {
+pub(crate) fn field_box<R>(ui: &mut Ui, p: &Pal, add: impl FnOnce(&mut Ui) -> R) -> R {
     Frame::new().fill(p.bg.to_opaque()).stroke(Stroke::new(1.0, p.line_soft)).corner_radius(8).inner_margin(Margin::symmetric(8, 5)).show(ui, add).inner
 }
 
 // destructive button: first click arms it ("Sure?"), second click returns true.
-fn confirm_button(ui: &mut Ui, p: &Pal, armed: &mut Option<String>, key: &str, label: &str) -> bool {
+pub(crate) fn confirm_button(ui: &mut Ui, p: &Pal, armed: &mut Option<String>, key: &str, label: &str) -> bool {
     let is_armed = armed.as_deref() == Some(key);
     let text = RichText::new(if is_armed { "Sure?" } else { label }).font(FontId::new(13.5, medium())).color(if is_armed { p.err } else { p.text });
     if ui.add(egui::Button::new(text).fill(p.raised).corner_radius(8)).clicked() {
